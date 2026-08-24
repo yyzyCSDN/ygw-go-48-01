@@ -21,9 +21,10 @@ func NewStore() *Store {
 	return &Store{results: make(map[model.WindowID]*model.WindowResult)}
 }
 
-// Update folds a value into a window's result. It applies the value to the
-// published aggregate even after the window has been emitted, so a late event
-// for an already-fired window changes what downstream consumers already saw.
+// Update folds a value into a window's result. Once the window has been
+// published by EmitResult, the result is immutable: the value is diverted to
+// the late-only accumulation so the aggregate downstream consumers already saw
+// can never be overwritten by a late event.
 func (s *Store) Update(w model.WindowID, value int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -31,6 +32,10 @@ func (s *Store) Update(w model.WindowID, value int64) {
 	if r == nil {
 		r = &model.WindowResult{Window: w}
 		s.results[w] = r
+	}
+	if r.Emitted {
+		r.ApplyLate(value)
+		return
 	}
 	r.Apply(value)
 }

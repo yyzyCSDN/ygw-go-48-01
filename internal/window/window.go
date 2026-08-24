@@ -61,9 +61,10 @@ func (m *Manager) WindowFor(ts int64) model.WindowID {
 	return model.WindowID{Start: start, End: start + m.size}
 }
 
-// Ingest folds one data event into its tumbling window. Events for already
-// closed windows are still routed into the shared result through the regular
-// update path, which can overwrite the published aggregate.
+// Ingest folds one data event into its tumbling window. Events that arrive
+// after the window has already fired are routed onto the late-only
+// accumulation path, so the published aggregate downstream consumers already
+// saw stays immutable.
 func (m *Manager) Ingest(ev model.Event) IngestOutcome {
 	w := m.WindowFor(ev.Timestamp)
 	m.mu.Lock()
@@ -75,7 +76,7 @@ func (m *Manager) Ingest(ev model.Event) IngestOutcome {
 		m.catalog.Open(w, ev.Timestamp)
 	}
 	if mw.state == model.WindowClosed {
-		m.sink.Update(w, ev.Value)
+		m.sink.LateUpdate(w, ev.Value)
 		m.catalog.RecordLate(w)
 		return OutcomeLate
 	}
