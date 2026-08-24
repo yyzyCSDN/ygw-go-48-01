@@ -18,25 +18,32 @@ func NewTracker(epoch int64) *Tracker {
 	return &Tracker{current: epoch, confirmed: epoch}
 }
 
-// Advance raises the tentative frontier and immediately publishes it as the
-// confirmed watermark, without waiting for the source to drain in-flight
-// events below the frontier.
+// Advance raises the tentative frontier only. It must not publish the
+// confirmed watermark: a window trigger observes the confirmed value to
+// decide when an interval is safe to close, so publishing a frontier that
+// the source has not finished draining would let the trigger close a window
+// while the interval's final events are still in flight. Publication is
+// deferred to Confirm, which the source calls only after every event at or
+// below the frontier has been handed to the downstream pipeline.
 func (t *Tracker) Advance(ts int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if ts > t.current {
 		t.current = ts
 	}
-	t.confirmed = t.current
 }
 
-// Confirm publishes the tentative frontier as the confirmed watermark. The
-// source calls this only after all events up to the frontier have been handed
-// to the downstream pipeline.
+// Confirm publishes the tentative frontier as the confirmed watermark, but
+// only up to current; it never raises current itself. The source calls this
+// only after all events up to the frontier have been handed to the downstream
+// pipeline, so any window trigger that observes the confirmed value knows the
+// interval's events have already been ingested.
 func (t *Tracker) Confirm() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.confirmed = t.current
+	if t.current > t.confirmed {
+		t.confirmed = t.current
+	}
 }
 
 // Confirmed returns the watermark value that window triggers may rely on.

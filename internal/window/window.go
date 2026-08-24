@@ -84,10 +84,12 @@ func (m *Manager) Ingest(ev model.Event) IngestOutcome {
 }
 
 // MaybeTrigger closes every open window whose end is not greater than the
-// tentative frontier. The trigger reads the raw advance value, so a window can
-// be closed while the final events of the interval are still in flight.
+// confirmed watermark. The trigger observes the confirmed frontier, which the
+// source only publishes after draining every event at or below it, so a
+// window is never closed while the interval's final events are still in
+// flight.
 func (m *Manager) MaybeTrigger(tracker *watermark.Tracker) []model.WindowResult {
-	confirmed := tracker.Current()
+	confirmed := tracker.Confirmed()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var emitted []model.WindowResult
