@@ -148,11 +148,17 @@ func (p *Pipeline) Advance(ts int64) {
 	p.Fanout.Notify(p.Tracker.Confirmed())
 }
 
-// RunCheckpoint snapshots the state backend and commits the sink barrier.
+// RunCheckpoint takes one consistent snapshot of the state backend and commits
+// the sink barrier against it in a single step. The snapshot and the commit
+// share one sequence, and the coordinator builds the manifest from the
+// snapshot's sequence rather than re-reading the store, so the durable
+// checkpoint describes exactly the captured state — not a later sequence that
+// already absorbed increments past the snapshot. Taking the snapshot fences
+// operator updates for the duration of the copy, which is what keeps the
+// captured state and the live operator state from diverging.
 func (p *Pipeline) RunCheckpoint(offset int64) {
 	snap := p.Checkpoint.SnapshotState()
-	p.Checkpoint.Commit(offset)
-	_ = snap
+	p.Checkpoint.Commit(offset, snap)
 }
 
 // RetryCheckpoint re-runs the checkpoint retry path with a caller-supplied

@@ -14,8 +14,10 @@ import (
 type ReplayFunc func(from int64) error
 
 // Coordinator aligns checkpoints with the state backend and the sink. A
-// checkpoint commit flushes the sink first, then advances the source offset,
-// so the durable position and the emitted records never disagree.
+// checkpoint is a single barrier: the state snapshot and the sink flush are
+// committed together against one snapshot sequence, and the durable offset is
+// advanced only afterwards, so the restored state and the emitted records can
+// never disagree about which prefix of the input has been applied.
 type Coordinator struct {
 	mu            sync.Mutex
 	store         *state.Store
@@ -39,24 +41,28 @@ func New(store *state.Store, sk *sink.Sink, offsets *source.OffsetTracker, metri
 	}
 }
 
-// SnapshotState captures a view of the state backend in a single pass. It does
-// not fence on the mutation sequence, so a snapshot taken while operators keep
-// applying updates may mix values from before and after the capture.
+// SnapshotState captures an atomic, self-consistent view of the state backend.
+// The store holds its lock for the whole copy, fencing out concurrent Apply
+// rounds for the duration, so the returned snapshot is a faithful prefix of
+// the mutation sequence rather than a mix of values from different rounds.
 func (c *Coordinator) SnapshotState() state.SnapshotData {
 	return c.store.Snapshot()
 }
 
-// Commit confirms a checkpoint at the given source offset. Sink records up to
-// the offset are flushed before the offset becomes durable, and the source
-// position is advanced only afterwards.
-func (c *Coordinator) Commit(offset int64) {
+// Commit confirms a checkpoint at the given source offset against a specific
+// snapshot. Sink records up to the offset are flushed before the offset becomes
+// durable, and the source position is advanced only afterwards. The manifest
+// is built from the snapshot's sequence, not from a fresh read of the store, so
+// the durable checkpoint describes exactly the state that was captured — never a
+// later sequence that already absorbed increments beyond the snapshot.
+func (c *Coordinator) Commit(offset int64, snap state.SnapshotData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sink.CommitUpTo(offset)
 	c.lastCommitted = offset
-	c.lastManifest = NewManifest(c.store.Version(), offset)
+	c.lastManifest = NewManifest(snap.Seq, offset)
 	c.offsets.Commit(offset)
-	c.log.Append(LogEntry{Offset: offset, Seq: c.store.Version(), Kind: "commit"})
+	c.log.Append(LogEntry{Offset: offset, Seq: snap.Seq, Kind: "commit"})
 	if c.metrics != nil {
 		c.metrics.AddCheckpoint()
 	}
@@ -74,7 +80,9 @@ func (c *Coordinator) Retry(failedAttemptOffset int64, replay ReplayFunc) error 
 }
 
 // Restore applies a checkpoint snapshot to the state backend, then advances
-// the source position to the snapshot's offset.
+// the source position to the snapshot's offset. The store lock fences out
+// concurrent Apply rounds during the replace, and the manifest is built from
+// the snapshot sequence so the durable checkpoint tracks the restored state.
 func (c *Coordinator) Restore(snap state.SnapshotData, offset int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

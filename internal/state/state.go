@@ -5,22 +5,29 @@ import (
 	"sync"
 )
 
-// SnapshotData is a point-in-time capture of the state store plus the pending
-// increment journal that must be replayed on top of a restored snapshot.
+// SnapshotData is a point-in-time capture of the state store. Data and Applied
+// are consistent copies of every committed key and every applied offset taken
+// under the store lock, and Seq is the mutation sequence at the instant the
+// copy was made. Because the copies and the sequence are read together under
+// the same lock, a snapshot never mixes values from different mutation
+// rounds: every key and every applied offset reflects the same prefix of the
+// mutation sequence.
 type SnapshotData struct {
 	Data    map[string]int64
-	Pending map[string]int64
+	Applied map[int64]bool
 	Seq     int64
 }
 
-// Store is the keyed state backend. It keeps committed values in Data and an
-// increment journal in Pending. Every mutation raises Seq; snapshots record
-// the sequence so a restore can replay increments that arrived after the
-// snapshot was taken.
+// Store is the keyed state backend. Every mutation runs under mu and raises
+// seq, and every snapshot copies the maps under the same mu, so snapshots and
+// increments converge on a single total order: a snapshot is always a faithful
+// prefix of the mutation sequence, and a restore always resets to that prefix.
+// There is no separate "increment journal" replayed on top of a snapshot; the
+// snapshot already contains every increment up to Seq, and increments after
+// Seq are re-applied by the source replay path.
 type Store struct {
 	mu      sync.Mutex
 	data    map[string]int64
-	pending map[string]int64
 	latest  map[string]int64
 	applied map[int64]bool
 	seq     int64
@@ -30,18 +37,16 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{
 		data:    make(map[string]int64),
-		pending: make(map[string]int64),
 		latest:  make(map[string]int64),
 		applied: make(map[int64]bool),
 	}
 }
 
-// Apply folds a delta into a key and journals it as an unmerged increment.
+// Apply folds a delta into a key and raises the mutation sequence.
 func (s *Store) Apply(key string, delta int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] += delta
-	s.pending[key] += delta
 	s.seq++
 }
 
@@ -51,7 +56,6 @@ func (s *Store) ApplyRound(deltas map[string]int64) {
 	defer s.mu.Unlock()
 	for key, delta := range deltas {
 		s.data[key] += delta
-		s.pending[key] += delta
 	}
 	s.seq++
 }
@@ -72,32 +76,38 @@ func (s *Store) Latest(key string) (int64, bool) {
 	return value, ok
 }
 
-// Snapshot captures the committed data, the pending journal, and the current
-// sequence without holding the store lock. Concurrent Apply rounds can mutate
-// the map while the copy is in progress, so the capture may mix values from
-// different rounds.
+// Snapshot copies every committed key, every applied offset, and the current
+// sequence under the store lock. Holding the lock for the whole copy fences
+// out concurrent Apply rounds — operator updates effectively pause for the
+// duration of the copy — so the capture is an atomic, self-consistent
+// point-in-time view rather than a mix of values from before and after the
+// capture. The returned maps are independent copies; callers may mutate them
+// or retain them across later mutations without affecting the store.
 func (s *Store) Snapshot() SnapshotData {
-	snap := SnapshotData{
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SnapshotData{
 		Data:    copyMap(s.data),
-		Pending: copyMap(s.pending),
+		Applied: copyApplied(s.applied),
 		Seq:     s.seq,
 	}
-	s.pending = make(map[string]int64)
-	return snap
 }
 
-// RestoreSnapshot replaces committed data with a captured snapshot and then
-// replays every increment that arrived after the snapshot was taken, so keys
-// updated concurrently with the restore are never lost.
+// RestoreSnapshot resets the committed state to a captured snapshot. The store
+// lock is held for the whole replace, so no Apply round can interleave and
+// produce a half-old, half-new map. Seq is rewound to the snapshot sequence
+// and the applied-offset set is restored to the snapshot's set, so a subsequent
+// source replay redoes exactly the offsets that arrived after the snapshot
+// (not in snap.Applied) and skips the ones the snapshot already absorbed (in
+// snap.Applied). The restored state therefore matches the operator state that
+// produced the snapshot; increments after the snapshot are neither lost nor
+// double-counted.
 func (s *Store) RestoreSnapshot(snap SnapshotData) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = copyMap(snap.Data)
-	for key, delta := range s.pending {
-		s.data[key] += delta
-	}
-	s.pending = make(map[string]int64)
-	s.seq = snap.Seq + 1
+	s.applied = copyApplied(snap.Applied)
+	s.seq = snap.Seq
 }
 
 // Get returns the committed value of a key.
@@ -167,6 +177,16 @@ func copyMap(src map[string]int64) map[string]int64 {
 	dst := make(map[string]int64, len(src))
 	for key, value := range src {
 		dst[key] = value
+	}
+	return dst
+}
+
+func copyApplied(src map[int64]bool) map[int64]bool {
+	dst := make(map[int64]bool, len(src))
+	for offset, ok := range src {
+		if ok {
+			dst[offset] = true
+		}
 	}
 	return dst
 }
