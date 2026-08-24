@@ -13,8 +13,10 @@ type ApplyFunc func(ev model.Event)
 
 // Manager schedules operators and owns the pause/resume buffer. While paused,
 // incoming events accumulate in the buffer; on resume the buffer is reconciled
-// against the applied offsets tracked in the state backend so records are
-// neither replayed twice nor skipped.
+// against the live applied-offset set so records are neither replayed twice
+// nor skipped. Records applied on another path during the pause (for example
+// via ApplyNow) update the same applied set, so the reconciliation always sees
+// the current truth rather than a point-in-time snapshot.
 type Manager struct {
 	mu        sync.Mutex
 	state     *state.Store
@@ -24,7 +26,6 @@ type Manager struct {
 	paused    bool
 	dag       *DAG
 	applied   map[int64]bool
-	pauseApplied map[int64]bool
 }
 
 // NewManager creates an operator manager that applies records through the
@@ -95,19 +96,19 @@ func (m *Manager) Pause() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.paused = true
-	m.pauseApplied = make(map[int64]bool, len(m.applied))
-	for offset := range m.applied {
-		m.pauseApplied[offset] = true
-	}
 	for _, instance := range m.instances {
 		instance.Pause()
 	}
 }
 
-// Resume replays the buffered events using the applied set captured when the
-// topology paused. Records completed on another path during the pause are not
-// visible to the reconciliation, and the replay starts after the first buffer
-// entry, so some records are replayed twice while the first one is skipped.
+// Resume replays the buffered events in the order they entered the buffer,
+// skipping any record that was already applied (for example via ApplyNow while
+// paused). Reconciliation is done against the live applied set rather than a
+// point-in-time snapshot: a record applied on another path during the pause is
+// still visible, so it is never replayed twice, and every buffered record is
+// visited, so none is skipped. Buffer order is preserved because the source
+// already delivers events in watermark-sorted (event-time) order; reordering
+// by offset would break that order.
 func (m *Manager) Resume() []model.Event {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -120,9 +121,9 @@ func (m *Manager) Resume() []model.Event {
 		return nil
 	}
 	var replayed []model.Event
-	for i := 1; i < len(m.buffer); i++ {
+	for i := 0; i < len(m.buffer); i++ {
 		ev := m.buffer[i]
-		if m.pauseApplied[ev.Offset] {
+		if m.applied[ev.Offset] {
 			continue
 		}
 		m.applied[ev.Offset] = true
