@@ -49,16 +49,26 @@ func (s *SessionManager) Touch(key string, ts int64, value int64, hasValue bool)
 		if ts < ss.window.Start {
 			ss.window.Start = ts
 		}
-		ss.lastActive = ts
+		// Slide the session end forward with the latest activity so a timeout
+		// scan never closes a session while an event is still within the live
+		// gap. Only the largest event time seen advances liveness: a late,
+		// smaller-timestamp event must not pull the end backward and reopen a
+		// premature timeout window.
+		if ts > ss.lastActive {
+			ss.lastActive = ts
+			ss.window.End = ts + s.timeout
+		}
 	}
 	if hasValue {
 		ss.values = append(ss.values, value)
 	}
 }
 
-// ScanTimeout closes sessions whose fixed window end has passed. Because the
-// end is not refreshed when an event touches the session, a session can be
-// split even though the event arrived inside the live gap.
+// ScanTimeout closes sessions whose live gap has elapsed. The session end is
+// lastActive + timeout, refreshed on every touch, so an event that just
+// arrived (which is at most the confirmed watermark driving this scan) has
+// already pushed the end past `now` and the session is never split. A session
+// only fires here when no event for the key has been seen for the whole gap.
 func (s *SessionManager) ScanTimeout(now int64) []model.WindowResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,6 +77,10 @@ func (s *SessionManager) ScanTimeout(now int64) []model.WindowResult {
 		if ss.state == model.WindowClosed {
 			continue
 		}
+		// `now` is the confirmed watermark, which only advances after every
+		// event up to it has been touched. Since each touch sets
+		// End = lastActive + timeout, an event at `now` leaves End > now and
+		// skips this close — the session survives until a full gap is idle.
 		if now < ss.window.End {
 			continue
 		}
